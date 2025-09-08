@@ -154,11 +154,12 @@ type WorkloadStats struct {
 
 // CloudWatchConfig holds CloudWatch configuration
 type CloudWatchConfig struct {
-	Enabled   bool
-	Region    string
-	Namespace string
-	Client    *cloudwatch.Client
-	Hostname  string
+	Enabled      bool
+	Region       string
+	Namespace    string
+	Client       *cloudwatch.Client
+	Hostname     string
+	HighFidelity bool   // Enable per-second metric emission
 }
 
 func NewWorkloadStats() *WorkloadStats {
@@ -171,11 +172,12 @@ func NewWorkloadStats() *WorkloadStats {
 }
 
 // NewCloudWatchConfig creates a new CloudWatch configuration
-func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchConfig, error) {
+func NewCloudWatchConfig(enabled bool, region, namespace string, highFidelity bool) (*CloudWatchConfig, error) {
 	cwConfig := &CloudWatchConfig{
-		Enabled:   enabled,
-		Region:    region,
-		Namespace: namespace,
+		Enabled:      enabled,
+		Region:       region,
+		Namespace:    namespace,
+		HighFidelity: highFidelity,
 	}
 
 	if !enabled {
@@ -1037,6 +1039,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	cloudwatchEnabled, _ := cmd.Flags().GetBool("cloudwatch-enabled")
 	cloudwatchRegion, _ := cmd.Flags().GetString("cloudwatch-region")
 	cloudwatchNamespace, _ := cmd.Flags().GetString("cloudwatch-namespace")
+	cloudwatchHighFidelity, _ := cmd.Flags().GetBool("cloudwatch-high-fidelity")
 
 	// Parse and validate parameters
 	setRatio, getRatio, err := parseRatio(ratioStr)
@@ -1084,13 +1087,13 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
 	// Initialize CloudWatch configuration
-	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace)
+	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace, cloudwatchHighFidelity)
 	if err != nil {
 		log.Printf("Warning: Failed to initialize CloudWatch: %v", err)
 		cloudwatchConfig = &CloudWatchConfig{Enabled: false}
 	} else if cloudwatchEnabled {
-		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s\n",
-			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname)
+		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s, high-fidelity=%v\n",
+			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname, cloudwatchHighFidelity)
 	}
 
 	workerCount, _ := cmd.Flags().GetInt("momento-client-worker-count")
@@ -1912,6 +1915,33 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
+	// Create a separate ticker for high-fidelity CloudWatch metrics (per-second)
+	var cwTicker *time.Ticker
+	if cloudwatchConfig != nil && cloudwatchConfig.Enabled && cloudwatchConfig.HighFidelity {
+		cwTicker = time.NewTicker(1 * time.Second)
+		defer cwTicker.Stop()
+		
+		// Start goroutine for per-second CloudWatch emissions
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-cwTicker.C:
+					// Get current metrics for CloudWatch
+					getCurrentOps, _, _, getP99, _ := stats.GetStats.GetPreviousWindowStats()
+					setCurrentOps, _, _, setP99, _ := stats.SetStats.GetPreviousWindowStats()
+					currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+					currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+					currentTotalQPS := currentWindowGetOps + currentWindowSetOps
+					
+					// Emit to CloudWatch every second
+					cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
+				}
+			}
+		}()
+	}
+
 	startTime := time.Now()
 	totalDuration := time.Duration(testTime) * time.Second
 
@@ -2015,8 +2045,10 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 				fmt.Print(progressLine)
 
-				// Emit CloudWatch metrics
-				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
+				// Emit CloudWatch metrics (only in standard mode, high-fidelity uses separate goroutine)
+				if cloudwatchConfig != nil && cloudwatchConfig.Enabled && !cloudwatchConfig.HighFidelity {
+					cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
+				}
 			}
 		}
 	}
@@ -2456,4 +2488,5 @@ func init() {
 	runCmd.Flags().Bool("cloudwatch-enabled", true, "Enable CloudWatch metrics emission")
 	runCmd.Flags().String("cloudwatch-region", "us-east-2", "AWS region for CloudWatch metrics")
 	runCmd.Flags().String("cloudwatch-namespace", "MomentoBenchmark", "CloudWatch namespace for metrics")
+	runCmd.Flags().Bool("cloudwatch-high-fidelity", true, "Enable high-fidelity per-second CloudWatch metrics")
 }
