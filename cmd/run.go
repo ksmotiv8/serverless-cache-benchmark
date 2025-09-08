@@ -1912,6 +1912,31 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
+	// Start goroutine for per-second CloudWatch emissions
+	if cloudwatchConfig != nil && cloudwatchConfig.Enabled {
+		go func() {
+			cwTicker := time.NewTicker(1 * time.Second)
+			defer cwTicker.Stop()
+			
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-cwTicker.C:
+					// Get current metrics
+					getCurrentOps, _, _, getP99, _ := stats.GetStats.GetPreviousWindowStats()
+					setCurrentOps, _, _, setP99, _ := stats.SetStats.GetPreviousWindowStats()
+					currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+					currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+					currentTotalQPS := currentWindowGetOps + currentWindowSetOps
+					
+					// Emit to CloudWatch every second
+					cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
+				}
+			}
+		}()
+	}
+
 	startTime := time.Now()
 	totalDuration := time.Duration(testTime) * time.Second
 
@@ -2014,9 +2039,6 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				)
 
 				fmt.Print(progressLine)
-
-				// Emit CloudWatch metrics
-				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
 			}
 		}
 	}
