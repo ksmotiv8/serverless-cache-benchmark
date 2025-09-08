@@ -24,6 +24,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 )
@@ -149,6 +152,15 @@ type WorkloadStats struct {
 	CSVLogger    *CSVLogger        // CSV output logger
 }
 
+// CloudWatchConfig holds CloudWatch configuration
+type CloudWatchConfig struct {
+	Enabled   bool
+	Region    string
+	Namespace string
+	Client    *cloudwatch.Client
+	Hostname  string
+}
+
 func NewWorkloadStats() *WorkloadStats {
 	return &WorkloadStats{
 		GetStats:   NewPerformanceStats(),
@@ -156,6 +168,139 @@ func NewWorkloadStats() *WorkloadStats {
 		SetupStats: NewPerformanceStats(),
 		TimeBlocks: make([]TimeBlockStats, 0),
 	}
+}
+
+// NewCloudWatchConfig creates a new CloudWatch configuration
+func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchConfig, error) {
+	cwConfig := &CloudWatchConfig{
+		Enabled:   enabled,
+		Region:    region,
+		Namespace: namespace,
+	}
+
+	if !enabled {
+		return cwConfig, nil
+	}
+
+	// Get hostname
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+		log.Printf("Warning: Failed to get hostname: %v", err)
+	}
+	cwConfig.Hostname = hostname
+
+	// Load AWS config
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	// Create CloudWatch client
+	cwConfig.Client = cloudwatch.NewFromConfig(awsCfg)
+
+	return cwConfig, nil
+}
+
+// emitCloudWatchMetrics emits metrics to CloudWatch
+func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float64, getP99, setP99 int64) {
+	if !cw.Enabled || cw.Client == nil {
+		return
+	}
+
+	// Create metric data
+	metricData := []types.MetricDatum{
+		{
+			MetricName: stringPtr("GetOpsPerSecond"),
+			Value:      float64Ptr(getOps),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  stringPtr("Host"),
+					Value: stringPtr(cw.Hostname),
+				},
+			},
+			Timestamp: timePtr(time.Now()),
+		},
+		{
+			MetricName: stringPtr("SetOpsPerSecond"),
+			Value:      float64Ptr(setOps),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  stringPtr("Host"),
+					Value: stringPtr(cw.Hostname),
+				},
+			},
+			Timestamp: timePtr(time.Now()),
+		},
+		{
+			MetricName: stringPtr("TotalQPS"),
+			Value:      float64Ptr(totalQPS),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  stringPtr("Host"),
+					Value: stringPtr(cw.Hostname),
+				},
+			},
+			Timestamp: timePtr(time.Now()),
+		},
+		{
+			MetricName: stringPtr("GetLatencyP99"),
+			Value:      float64Ptr(float64(getP99)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: []types.Dimension{
+				{
+					Name:  stringPtr("Host"),
+					Value: stringPtr(cw.Hostname),
+				},
+			},
+			Timestamp: timePtr(time.Now()),
+		},
+		{
+			MetricName: stringPtr("SetLatencyP99"),
+			Value:      float64Ptr(float64(setP99)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: []types.Dimension{
+				{
+					Name:  stringPtr("Host"),
+					Value: stringPtr(cw.Hostname),
+				},
+			},
+			Timestamp: timePtr(time.Now()),
+		},
+	}
+
+	// Emit metrics asynchronously
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_, err := cw.Client.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
+			Namespace:  stringPtr(cw.Namespace),
+			MetricData: metricData,
+		})
+
+		if err != nil {
+			log.Printf("Warning: Failed to emit CloudWatch metrics: %v", err)
+		}
+	}()
+}
+
+// Helper functions for CloudWatch types
+func stringPtr(s string) *string {
+	return &s
+}
+
+func float64Ptr(f float64) *float64 {
+	return &f
+}
+
+func timePtr(t time.Time) *time.Time {
+	return &t
 }
 
 // NewCSVLogger creates a new CSV logger with the specified filename
@@ -888,6 +1033,11 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	randomData, _ := cmd.Flags().GetBool("random-data")
 	defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
 
+	// CloudWatch parameters
+	cloudwatchEnabled, _ := cmd.Flags().GetBool("cloudwatch-enabled")
+	cloudwatchRegion, _ := cmd.Flags().GetString("cloudwatch-region")
+	cloudwatchNamespace, _ := cmd.Flags().GetString("cloudwatch-namespace")
+
 	// Parse and validate parameters
 	setRatio, getRatio, err := parseRatio(ratioStr)
 	if err != nil {
@@ -933,6 +1083,16 @@ func runWorkload(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
+	// Initialize CloudWatch configuration
+	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize CloudWatch: %v", err)
+		cloudwatchConfig = &CloudWatchConfig{Enabled: false}
+	} else if cloudwatchEnabled {
+		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s\n",
+			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname)
+	}
+
 	workerCount, _ := cmd.Flags().GetInt("momento-client-worker-count")
 
 	// For Momento, create cache once upfront to avoid spam
@@ -974,14 +1134,14 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	} else {
 		// Use static configuration - run the original logic
 		runStaticWorkload(cmd, cacheType, clientCount, rps, zipfExp, ratioStr, keyPrefix, keyMin,
-			totalKeys, dataSize, randomData, defaultTTL, workerCount, measureSetup, verbose, quiet, timeoutSeconds, testTime, stats)
+			totalKeys, dataSize, randomData, defaultTTL, workerCount, measureSetup, verbose, quiet, timeoutSeconds, testTime, stats, cloudwatchConfig)
 	}
 }
 
 // runStaticWorkload runs the original static workload logic
 func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps int, zipfExp float64,
 	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, workerCount int, measureSetup, verbose, quiet bool,
-	timeoutSeconds, testTime int, stats *WorkloadStats) {
+	timeoutSeconds, testTime int, stats *WorkloadStats, cloudwatchConfig *CloudWatchConfig) {
 
 	// Parse ratio
 	setRatio, getRatio, err := parseRatio(ratioStr)
@@ -1048,7 +1208,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	}
 
 	// Start progress reporting
-	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose)
+	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose, cloudwatchConfig)
 
 	// Wait for all workers to complete
 	wg.Wait()
@@ -1748,7 +1908,7 @@ func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
 }
 
 // reportStaticProgress reports progress for static workload with progress bar
-func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool) {
+func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool, cloudwatchConfig *CloudWatchConfig) {
 	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
@@ -1854,6 +2014,9 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				)
 
 				fmt.Print(progressLine)
+
+				// Emit CloudWatch metrics
+				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
 			}
 		}
 	}
@@ -2288,4 +2451,9 @@ func init() {
 	// Data Options
 	runCmd.Flags().IntP("data-size", "d", 32, "Object data size in bytes")
 	runCmd.Flags().BoolP("random-data", "R", false, "Use random data instead of pattern data")
+
+	// CloudWatch Options
+	runCmd.Flags().Bool("cloudwatch-enabled", true, "Enable CloudWatch metrics emission")
+	runCmd.Flags().String("cloudwatch-region", "us-east-2", "AWS region for CloudWatch metrics")
+	runCmd.Flags().String("cloudwatch-namespace", "MomentoBenchmark", "CloudWatch namespace for metrics")
 }
