@@ -32,6 +32,15 @@ type PerformanceStats struct {
 	currentWindowStartSecond int64
 	currentHistogram         *hdrhistogram.Histogram
 	windowedHistograms       map[int64]*hdrhistogram.Histogram
+	
+	// Per-second metrics for high-fidelity monitoring
+	// These fields enable CloudWatch to emit metrics with 1-second granularity
+	// instead of the default 5-second metric window
+	perSecondOps      map[int64]int64 // Operations per second (rolling 60s window)
+	perSecondErrors   map[int64]int64 // Errors per second (rolling 60s window)
+	lastSecond        int64           // Track last second for metrics
+	currentSecondOps  int64           // Current second operations counter
+	currentSecondErrors int64         // Current second errors counter
 }
 
 func NewPerformanceStats() *PerformanceStats {
@@ -46,6 +55,9 @@ func NewPerformanceStats() *PerformanceStats {
 		latencyChannel:     make(chan LatencyEvent, 1000000), // Buffered channel to prevent blocking
 		errorChannel:       make(chan struct{}, 100),         // Buffered for errors
 		done:               make(chan struct{}),
+		perSecondOps:       make(map[int64]int64),
+		perSecondErrors:    make(map[int64]int64),
+		lastSecond:         time.Now().Unix(),
 	}
 
 	// Start the stats collection goroutine
@@ -60,6 +72,29 @@ func (ps *PerformanceStats) statsCollector() {
 		select {
 		case event := <-ps.latencyChannel:
 			currentSecond := event.Timestamp.Unix()
+
+			// Track per-second metrics for high-fidelity CloudWatch monitoring
+			if currentSecond != ps.lastSecond {
+				// Save current second's data before moving to new second
+				if ps.currentSecondOps > 0 || ps.currentSecondErrors > 0 {
+					ps.perSecondOps[ps.lastSecond] = ps.currentSecondOps
+					ps.perSecondErrors[ps.lastSecond] = ps.currentSecondErrors
+				}
+				// Reset counters for new second
+				ps.currentSecondOps = 0
+				ps.currentSecondErrors = 0
+				ps.lastSecond = currentSecond
+				
+				// Clean up old per-second data (maintain 60-second rolling window)
+				// This prevents unbounded memory growth during long-running tests
+				for sec := range ps.perSecondOps {
+					if currentSecond - sec > 60 {
+						delete(ps.perSecondOps, sec)
+						delete(ps.perSecondErrors, sec)
+					}
+				}
+			}
+			ps.currentSecondOps++
 
 			// Record in overall histogram (no lock needed, single goroutine)
 			ps.Histogram.RecordValue(event.LatencyMicros)
@@ -79,6 +114,22 @@ func (ps *PerformanceStats) statsCollector() {
 			ps.TotalOps++
 
 		case <-ps.errorChannel:
+			currentSecond := time.Now().Unix()
+			
+			// Track per-second errors
+			if currentSecond != ps.lastSecond {
+				// Save current second's data
+				if ps.currentSecondOps > 0 || ps.currentSecondErrors > 0 {
+					ps.perSecondOps[ps.lastSecond] = ps.currentSecondOps
+					ps.perSecondErrors[ps.lastSecond] = ps.currentSecondErrors
+				}
+				// Reset for new second
+				ps.currentSecondOps = 0
+				ps.currentSecondErrors = 0
+				ps.lastSecond = currentSecond
+			}
+			ps.currentSecondErrors++
+			
 			// No atomic needed - only this goroutine modifies these counters
 			ps.FailedOps++
 			ps.TotalOps++
@@ -162,6 +213,41 @@ func (ps *PerformanceStats) GetOverallStats() (int64, int64, int64, float64) {
 	qps := ps.GetQPS()
 
 	return total, success, failed, qps
+}
+
+// GetOpsLastSecond returns operations count for the last completed second
+func (ps *PerformanceStats) GetOpsLastSecond() int64 {
+	lastSec := time.Now().Unix() - 1
+	if ops, exists := ps.perSecondOps[lastSec]; exists {
+		return ops
+	}
+	return 0
+}
+
+// GetErrorsLastSecond returns error count for the last completed second
+func (ps *PerformanceStats) GetErrorsLastSecond() int64 {
+	lastSec := time.Now().Unix() - 1
+	if errors, exists := ps.perSecondErrors[lastSec]; exists {
+		return errors
+	}
+	return 0
+}
+
+// GetLastSecondPercentile returns percentile for the last second's latencies
+func (ps *PerformanceStats) GetLastSecondPercentile(percentile float64) int64 {
+	lastSec := time.Now().Unix() - 1
+	
+	// Check if we have a histogram for the last second in the windowed histograms
+	if hist, exists := ps.windowedHistograms[lastSec]; exists && hist.TotalCount() > 0 {
+		return hist.ValueAtQuantile(percentile)
+	}
+	
+	// Fallback to current histogram if within the current window
+	if ps.currentHistogram != nil && ps.currentHistogram.TotalCount() > 0 {
+		return ps.currentHistogram.ValueAtQuantile(percentile)
+	}
+	
+	return 0
 }
 
 // Close shuts down the stats collector goroutine

@@ -152,13 +152,18 @@ type WorkloadStats struct {
 	CSVLogger    *CSVLogger        // CSV output logger
 }
 
-// CloudWatchConfig holds CloudWatch configuration
+// CloudWatchConfig holds CloudWatch configuration for metrics emission
+// Supports both standard (5-second) and high-fidelity (1-second) metric collection
 type CloudWatchConfig struct {
-	Enabled   bool
-	Region    string
-	Namespace string
-	Client    *cloudwatch.Client
-	Hostname  string
+	Enabled        bool
+	Region         string
+	Namespace      string
+	Client         *cloudwatch.Client
+	Hostname       string
+	HighFidelity   bool                      // Enable per-second metrics (vs 5-second default)
+	MetricBuffer   []types.MetricDatum      // Buffer for batching metrics (reduces API calls)
+	BufferMutex    sync.Mutex                // Mutex for thread-safe buffer access
+	LastFlushTime  time.Time                 // Track last flush time for batch control
 }
 
 func NewWorkloadStats() *WorkloadStats {
@@ -171,11 +176,14 @@ func NewWorkloadStats() *WorkloadStats {
 }
 
 // NewCloudWatchConfig creates a new CloudWatch configuration
-func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchConfig, error) {
+func NewCloudWatchConfig(enabled bool, region, namespace string, highFidelity bool) (*CloudWatchConfig, error) {
 	cwConfig := &CloudWatchConfig{
-		Enabled:   enabled,
-		Region:    region,
-		Namespace: namespace,
+		Enabled:      enabled,
+		Region:       region,
+		Namespace:    namespace,
+		HighFidelity: highFidelity,
+		MetricBuffer: make([]types.MetricDatum, 0, 100), // Pre-allocate for 100 metrics
+		LastFlushTime: time.Now(),
 	}
 
 	if !enabled {
@@ -204,90 +212,174 @@ func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchCon
 	return cwConfig, nil
 }
 
-// emitCloudWatchMetrics emits metrics to CloudWatch
-func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float64, getP99, setP99 int64) {
+// emitCloudWatchMetrics collects per-second metrics and adds them to the buffer
+// In high-fidelity mode, this is called every second to capture fine-grained metrics
+// Metrics are automatically batched and sent every 5 seconds or when buffer is full
+func (cw *CloudWatchConfig) emitCloudWatchMetrics(stats *WorkloadStats, timestamp time.Time) {
 	if !cw.Enabled || cw.Client == nil {
 		return
 	}
 
-	// Create metric data
-	metricData := []types.MetricDatum{
+	cw.BufferMutex.Lock()
+	defer cw.BufferMutex.Unlock()
+
+	// Calculate current metrics
+	getOps := float64(stats.GetStats.GetOpsLastSecond())
+	setOps := float64(stats.SetStats.GetOpsLastSecond())
+	totalOps := getOps + setOps
+	getErrors := float64(stats.GetStats.GetErrorsLastSecond())
+	setErrors := float64(stats.SetStats.GetErrorsLastSecond())
+	totalErrors := getErrors + setErrors
+	
+	// Get latency percentiles
+	getP50 := stats.GetStats.GetLastSecondPercentile(50.0)
+	getP99 := stats.GetStats.GetLastSecondPercentile(99.0)
+	setP50 := stats.SetStats.GetLastSecondPercentile(50.0)
+	setP99 := stats.SetStats.GetLastSecondPercentile(99.0)
+
+	// Common dimensions
+	dimensions := []types.Dimension{
+		{
+			Name:  stringPtr("Host"),
+			Value: stringPtr(cw.Hostname),
+		},
+	}
+
+	// Add metrics to buffer
+	newMetrics := []types.MetricDatum{
 		{
 			MetricName: stringPtr("GetOpsPerSecond"),
 			Value:      float64Ptr(getOps),
 			Unit:       types.StandardUnitCountSecond,
-			Dimensions: []types.Dimension{
-				{
-					Name:  stringPtr("Host"),
-					Value: stringPtr(cw.Hostname),
-				},
-			},
-			Timestamp: timePtr(time.Now()),
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
 		},
 		{
 			MetricName: stringPtr("SetOpsPerSecond"),
 			Value:      float64Ptr(setOps),
 			Unit:       types.StandardUnitCountSecond,
-			Dimensions: []types.Dimension{
-				{
-					Name:  stringPtr("Host"),
-					Value: stringPtr(cw.Hostname),
-				},
-			},
-			Timestamp: timePtr(time.Now()),
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
 		},
 		{
-			MetricName: stringPtr("TotalQPS"),
-			Value:      float64Ptr(totalQPS),
+			MetricName: stringPtr("TotalOpsPerSecond"),
+			Value:      float64Ptr(totalOps),
 			Unit:       types.StandardUnitCountSecond,
-			Dimensions: []types.Dimension{
-				{
-					Name:  stringPtr("Host"),
-					Value: stringPtr(cw.Hostname),
-				},
-			},
-			Timestamp: timePtr(time.Now()),
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
+		},
+		{
+			MetricName: stringPtr("GetErrorsPerSecond"),
+			Value:      float64Ptr(getErrors),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
+		},
+		{
+			MetricName: stringPtr("SetErrorsPerSecond"),
+			Value:      float64Ptr(setErrors),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
+		},
+		{
+			MetricName: stringPtr("TotalErrorsPerSecond"),
+			Value:      float64Ptr(totalErrors),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
+		},
+		{
+			MetricName: stringPtr("GetLatencyP50"),
+			Value:      float64Ptr(float64(getP50)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
 		},
 		{
 			MetricName: stringPtr("GetLatencyP99"),
 			Value:      float64Ptr(float64(getP99)),
 			Unit:       types.StandardUnitMicroseconds,
-			Dimensions: []types.Dimension{
-				{
-					Name:  stringPtr("Host"),
-					Value: stringPtr(cw.Hostname),
-				},
-			},
-			Timestamp: timePtr(time.Now()),
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
+		},
+		{
+			MetricName: stringPtr("SetLatencyP50"),
+			Value:      float64Ptr(float64(setP50)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
 		},
 		{
 			MetricName: stringPtr("SetLatencyP99"),
 			Value:      float64Ptr(float64(setP99)),
 			Unit:       types.StandardUnitMicroseconds,
-			Dimensions: []types.Dimension{
-				{
-					Name:  stringPtr("Host"),
-					Value: stringPtr(cw.Hostname),
-				},
-			},
-			Timestamp: timePtr(time.Now()),
+			Dimensions: dimensions,
+			Timestamp:  timePtr(timestamp),
 		},
 	}
 
-	// Emit metrics asynchronously
+	cw.MetricBuffer = append(cw.MetricBuffer, newMetrics...)
+
+	// Batch metrics to reduce CloudWatch API calls and costs
+	// Flush every 5 seconds or when approaching CloudWatch's 1000 metric limit
+	shouldFlush := time.Since(cw.LastFlushTime) >= 5*time.Second || len(cw.MetricBuffer) >= 1000
+	
+	if shouldFlush {
+		cw.flushMetrics()
+	}
+}
+
+// flushMetrics sends buffered metrics to CloudWatch (must be called with lock held)
+func (cw *CloudWatchConfig) flushMetrics() {
+	if len(cw.MetricBuffer) == 0 {
+		return
+	}
+
+	// Copy metrics for async send
+	metricsToSend := make([]types.MetricDatum, len(cw.MetricBuffer))
+	copy(metricsToSend, cw.MetricBuffer)
+	
+	// Clear buffer
+	cw.MetricBuffer = cw.MetricBuffer[:0]
+	cw.LastFlushTime = time.Now()
+
+	// Send metrics asynchronously to avoid blocking the main benchmark
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		// CloudWatch allows max 1000 metrics per request, so batch accordingly
+		for i := 0; i < len(metricsToSend); i += 1000 {
+			end := i + 1000
+			if end > len(metricsToSend) {
+				end = len(metricsToSend)
+			}
+			
+			batch := metricsToSend[i:end]
+			
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-		_, err := cw.Client.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
-			Namespace:  stringPtr(cw.Namespace),
-			MetricData: metricData,
-		})
+			_, err := cw.Client.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
+				Namespace:  stringPtr(cw.Namespace),
+				MetricData: batch,
+			})
 
-		if err != nil {
-			log.Printf("Warning: Failed to emit CloudWatch metrics: %v", err)
+			if err != nil {
+				log.Printf("Warning: Failed to emit CloudWatch metrics batch (size=%d): %v", len(batch), err)
+			}
 		}
 	}()
+}
+
+// Flush forces immediate sending of buffered metrics
+func (cw *CloudWatchConfig) Flush() {
+	if !cw.Enabled || cw.Client == nil {
+		return
+	}
+	
+	cw.BufferMutex.Lock()
+	defer cw.BufferMutex.Unlock()
+	
+	cw.flushMetrics()
 }
 
 // Helper functions for CloudWatch types
@@ -1037,6 +1129,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	cloudwatchEnabled, _ := cmd.Flags().GetBool("cloudwatch-enabled")
 	cloudwatchRegion, _ := cmd.Flags().GetString("cloudwatch-region")
 	cloudwatchNamespace, _ := cmd.Flags().GetString("cloudwatch-namespace")
+	cloudwatchHighFidelity, _ := cmd.Flags().GetBool("cloudwatch-high-fidelity")
 
 	// Parse and validate parameters
 	setRatio, getRatio, err := parseRatio(ratioStr)
@@ -1084,13 +1177,13 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
 	// Initialize CloudWatch configuration
-	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace)
+	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace, cloudwatchHighFidelity)
 	if err != nil {
 		log.Printf("Warning: Failed to initialize CloudWatch: %v", err)
 		cloudwatchConfig = &CloudWatchConfig{Enabled: false}
 	} else if cloudwatchEnabled {
-		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s\n",
-			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname)
+		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s, high-fidelity=%v\n",
+			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname, cloudwatchHighFidelity)
 	}
 
 	workerCount, _ := cmd.Flags().GetInt("momento-client-worker-count")
@@ -1909,8 +2002,34 @@ func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
 
 // reportStaticProgress reports progress for static workload with progress bar
 func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool, cloudwatchConfig *CloudWatchConfig) {
-	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
+	// For high-fidelity mode, report every second
+	tickerInterval := MetricWindowSizeSeconds * time.Second
+	if cloudwatchConfig != nil && cloudwatchConfig.HighFidelity {
+		tickerInterval = 1 * time.Second
+	}
+	
+	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
+	
+	// High-fidelity metrics goroutine for per-second CloudWatch emissions
+	// This runs independently from the main progress reporting to ensure
+	// we capture metrics every second regardless of the display interval
+	if cloudwatchConfig != nil && cloudwatchConfig.Enabled && cloudwatchConfig.HighFidelity {
+		go func() {
+			cwTicker := time.NewTicker(1 * time.Second)
+			defer cwTicker.Stop()
+			
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-cwTicker.C:
+					// Emit per-second metrics for high-fidelity monitoring
+					cloudwatchConfig.emitCloudWatchMetrics(stats, time.Now())
+				}
+			}
+		}()
+	}
 
 	startTime := time.Now()
 	totalDuration := time.Duration(testTime) * time.Second
@@ -1918,8 +2037,10 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 	for {
 		select {
 		case <-ctx.Done():
-			// Clear the progress line
-			//fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
+			// Flush any remaining CloudWatch metrics
+			if cloudwatchConfig != nil && cloudwatchConfig.Enabled {
+				cloudwatchConfig.Flush()
+			}
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -2014,9 +2135,11 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				)
 
 				fmt.Print(progressLine)
-
-				// Emit CloudWatch metrics
-				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99)
+			}
+			
+			// Emit CloudWatch metrics in normal mode (high-fidelity uses separate ticker)
+			if cloudwatchConfig != nil && cloudwatchConfig.Enabled && !cloudwatchConfig.HighFidelity {
+				cloudwatchConfig.emitCloudWatchMetrics(stats, time.Now())
 			}
 		}
 	}
@@ -2453,7 +2576,8 @@ func init() {
 	runCmd.Flags().BoolP("random-data", "R", false, "Use random data instead of pattern data")
 
 	// CloudWatch Options
-	runCmd.Flags().Bool("cloudwatch-enabled", true, "Enable CloudWatch metrics emission")
+	runCmd.Flags().Bool("cloudwatch-enabled", false, "Enable CloudWatch metrics emission")
 	runCmd.Flags().String("cloudwatch-region", "us-east-2", "AWS region for CloudWatch metrics")
 	runCmd.Flags().String("cloudwatch-namespace", "MomentoBenchmark", "CloudWatch namespace for metrics")
+	runCmd.Flags().Bool("cloudwatch-high-fidelity", true, "Enable high-fidelity per-second CloudWatch metrics")
 }
